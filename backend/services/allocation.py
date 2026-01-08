@@ -5,13 +5,124 @@ from schemas import AllocationResponse, OptimizeAllocationResponse
 from services.routing import calculate_distance
 
 
+def calculate_insertion_cost(
+    vehicle: Vehicle,
+    vehicle_shipments: list[Shipment],
+    new_shipment: Shipment
+) -> float:
+    """
+    Calculate the insertion cost (increase in total distance) if new_shipment is added to vehicle's route.
+    
+    Algorithm: Cheapest Insertion Heuristic (Simplified)
+    - For empty route: cost = distance(vehicle -> pickup -> drop)
+    - For existing route: Find nearest point to pickup, insert there
+      Then find best position for drop after pickup
+      Cost = detour distance added to route
+    """
+    if not vehicle_shipments:
+        # Empty route: cost is distance from vehicle to pickup to drop
+        dist_vehicle_pickup = calculate_distance(
+            vehicle.latitude, vehicle.longitude,
+            new_shipment.pickup_latitude, new_shipment.pickup_longitude
+        )
+        dist_pickup_drop = calculate_distance(
+            new_shipment.pickup_latitude, new_shipment.pickup_longitude,
+            new_shipment.drop_latitude, new_shipment.drop_longitude
+        )
+        return dist_vehicle_pickup + dist_pickup_drop
+    
+    # Build route points list
+    route_points = [(vehicle.latitude, vehicle.longitude)]
+    for shipment in vehicle_shipments:
+        route_points.append((shipment.pickup_latitude, shipment.pickup_longitude))
+        route_points.append((shipment.drop_latitude, shipment.drop_longitude))
+    
+    min_cost = float('inf')
+    
+    # Try inserting pickup at each position
+    for i in range(len(route_points)):
+        # Calculate cost to insert pickup after point i
+        if i == 0:
+            # After vehicle (start of route)
+            dist_to_pickup = calculate_distance(
+                route_points[0][0], route_points[0][1],
+                new_shipment.pickup_latitude, new_shipment.pickup_longitude
+            )
+            if len(route_points) > 1:
+                dist_pickup_to_next = calculate_distance(
+                    new_shipment.pickup_latitude, new_shipment.pickup_longitude,
+                    route_points[1][0], route_points[1][1]
+                )
+                dist_direct = calculate_distance(
+                    route_points[0][0], route_points[0][1],
+                    route_points[1][0], route_points[1][1]
+                )
+                pickup_cost = dist_to_pickup + dist_pickup_to_next - dist_direct
+            else:
+                pickup_cost = dist_to_pickup
+        else:
+            # In middle of route
+            dist_to_pickup = calculate_distance(
+                route_points[i][0], route_points[i][1],
+                new_shipment.pickup_latitude, new_shipment.pickup_longitude
+            )
+            if i + 1 < len(route_points):
+                dist_pickup_to_next = calculate_distance(
+                    new_shipment.pickup_latitude, new_shipment.pickup_longitude,
+                    route_points[i + 1][0], route_points[i + 1][1]
+                )
+                dist_direct = calculate_distance(
+                    route_points[i][0], route_points[i][1],
+                    route_points[i + 1][0], route_points[i + 1][1]
+                )
+                pickup_cost = dist_to_pickup + dist_pickup_to_next - dist_direct
+            else:
+                pickup_cost = dist_to_pickup
+        
+        # Now try inserting drop at each position after pickup
+        # Drop must come after pickup in the route
+        for j in range(i + 1, len(route_points) + 1):
+            # Calculate cost to insert drop after point j (which is after pickup at i)
+            dist_pickup_to_drop = calculate_distance(
+                new_shipment.pickup_latitude, new_shipment.pickup_longitude,
+                new_shipment.drop_latitude, new_shipment.drop_longitude
+            )
+            
+            if j < len(route_points):
+                # Drop inserted before existing point j
+                dist_drop_to_next = calculate_distance(
+                    new_shipment.drop_latitude, new_shipment.drop_longitude,
+                    route_points[j][0], route_points[j][1]
+                )
+                # The point before drop would be pickup (if j == i+1) or route_points[j-1]
+                if j == i + 1:
+                    # Drop right after pickup
+                    prev_point = (new_shipment.pickup_latitude, new_shipment.pickup_longitude)
+                else:
+                    prev_point = route_points[j - 1]
+                
+                dist_prev_to_next = calculate_distance(
+                    prev_point[0], prev_point[1],
+                    route_points[j][0], route_points[j][1]
+                )
+                drop_cost = dist_pickup_to_drop + dist_drop_to_next - dist_prev_to_next
+            else:
+                # Drop at end of route
+                drop_cost = dist_pickup_to_drop
+            
+            total_cost = pickup_cost + drop_cost
+            min_cost = min(min_cost, total_cost)
+    
+    return min_cost
+
+
 async def allocate_shipments(db: AsyncSession) -> AllocationResponse:
     """
-    Load Balancing Allocation Algorithm:
-    - Iterates through PENDING shipments (sorted by weight descending)
-    - For each shipment, finds ALL vehicles that have enough capacity and range
-    - Selection Criteria: Assigns to vehicle closest to pickup location OR least loaded
-    - Ensures shipments are distributed across all vehicles rather than overloading one
+    Cheapest Insertion Heuristic VRP Algorithm:
+    - For each unassigned shipment, calculate insertion cost for all eligible vehicles
+    - Insertion cost = increase in total route distance if shipment is added
+    - Assign shipment to vehicle with lowest insertion cost
+    - Respects capacity and range constraints strictly
     """
     # Fetch all pending shipments
     pending_result = await db.execute(
@@ -33,18 +144,31 @@ async def allocate_shipments(db: AsyncSession) -> AllocationResponse:
             message="No vehicles available"
         )
     
-    # Sort shipments by weight (descending) - heaviest first (priority)
-    sorted_shipments = sorted(pending_shipments, key=lambda s: s.weight, reverse=True)
+    # Sort shipments by priority: weight (descending) and distance (furthest first)
+    def shipment_priority(s: Shipment) -> float:
+        pickup_drop_distance = calculate_distance(
+            s.pickup_latitude, s.pickup_longitude,
+            s.drop_latitude, s.drop_longitude
+        )
+        return s.weight * 1000 + pickup_drop_distance  # Weight is primary, distance secondary
+    
+    sorted_shipments = sorted(pending_shipments, key=shipment_priority, reverse=True)
     
     assigned_count = 0
     failed_count = 0
     
+    # Track current assignments per vehicle for insertion cost calculation
+    vehicle_assignments: dict[str, list[Shipment]] = {
+        v.id: [] for v in vehicles
+    }
+    
     for shipment in sorted_shipments:
-        # Find ALL vehicles that can take this shipment
-        eligible_vehicles = []
+        best_vehicle = None
+        best_cost = float('inf')
         
+        # Find all eligible vehicles and calculate insertion cost
         for vehicle in vehicles:
-            # Check capacity constraint
+            # Check capacity constraint (strict - never overload)
             if vehicle.current_load + shipment.weight > vehicle.max_capacity:
                 continue
             
@@ -60,44 +184,24 @@ async def allocate_shipments(db: AsyncSession) -> AllocationResponse:
             total_approx_distance = dist_vehicle_pickup + dist_pickup_drop
             
             # Check if within range (allow 20% buffer for TSP routing)
-            if total_approx_distance <= vehicle.max_range * 1.2:
-                eligible_vehicles.append({
-                    'vehicle': vehicle,
-                    'distance_to_pickup': dist_vehicle_pickup,
-                    'current_load': vehicle.current_load
-                })
-        
-        if not eligible_vehicles:
-            # No vehicle can take this shipment
-            failed_count += 1
-            continue
-        
-        # Selection Criteria: Choose vehicle that is closest to pickup OR least loaded
-        # Strategy: Prioritize distance, but if distances are similar (within 10%), choose least loaded
-        best_vehicle_info = None
-        min_distance = float('inf')
-        min_load = float('inf')
-        
-        for vehicle_info in eligible_vehicles:
-            # Find the minimum distance
-            if vehicle_info['distance_to_pickup'] < min_distance:
-                min_distance = vehicle_info['distance_to_pickup']
-        
-        # If multiple vehicles have similar distances (within 10% of minimum), prefer least loaded
-        distance_threshold = min_distance * 1.1
-        
-        for vehicle_info in eligible_vehicles:
-            if vehicle_info['distance_to_pickup'] <= distance_threshold:
-                if vehicle_info['current_load'] < min_load:
-                    min_load = vehicle_info['current_load']
-                    best_vehicle_info = vehicle_info
+            if total_approx_distance > vehicle.max_range * 1.2:
+                continue
+            
+            # Calculate insertion cost for this vehicle
+            current_shipments = vehicle_assignments[vehicle.id]
+            insertion_cost = calculate_insertion_cost(vehicle, current_shipments, shipment)
+            
+            # Select vehicle with lowest insertion cost
+            if insertion_cost < best_cost:
+                best_cost = insertion_cost
+                best_vehicle = vehicle
         
         # Assign shipment to best vehicle
-        if best_vehicle_info:
-            vehicle = best_vehicle_info['vehicle']
-            shipment.assigned_vehicle_id = vehicle.id
+        if best_vehicle:
+            shipment.assigned_vehicle_id = best_vehicle.id
             shipment.status = ShipmentStatus.ASSIGNED
-            vehicle.current_load += shipment.weight
+            best_vehicle.current_load += shipment.weight
+            vehicle_assignments[best_vehicle.id].append(shipment)
             
             assigned_count += 1
         else:
@@ -108,16 +212,16 @@ async def allocate_shipments(db: AsyncSession) -> AllocationResponse:
     return AllocationResponse(
         assigned=assigned_count,
         failed=failed_count,
-        message=f"Allocated {assigned_count} shipments, {failed_count} failed"
+        message=f"Allocated {assigned_count} shipments (Cheapest Insertion VRP), {failed_count} failed"
     )
 
 
 async def optimize_allocation(db: AsyncSession) -> OptimizeAllocationResponse:
     """
-    Multi-Objective Optimization:
+    Multi-Objective Optimization with Cheapest Insertion Heuristic:
     1. Reset: Unassign all currently pending/assigned shipments
-    2. Assignment: Bin Packing with Priority/Weight sorting
-    3. Routing: TSP with Precedence (Pickup before Drop) for each vehicle
+    2. Assignment: Cheapest Insertion VRP algorithm
+    3. Routes are optimized on-demand using TSP with Precedence
     """
     try:
         # Step 1: Reset - Unassign all pending/assigned shipments
@@ -169,53 +273,63 @@ async def optimize_allocation(db: AsyncSession) -> OptimizeAllocationResponse:
                 message="No vehicles available"
             )
         
-        # Step 3: Bin Packing - Sort by weight (descending) for best fit
-        sorted_shipments = sorted(pending_shipments, key=lambda s: s.weight, reverse=True)
-        sorted_vehicles = sorted(vehicles, key=lambda v: v.max_capacity, reverse=True)
+        # Step 3: Cheapest Insertion VRP Algorithm
+        def shipment_priority(s: Shipment) -> float:
+            pickup_drop_distance = calculate_distance(
+                s.pickup_latitude, s.pickup_longitude,
+                s.drop_latitude, s.drop_longitude
+            )
+            return s.weight * 1000 + pickup_drop_distance
+        
+        sorted_shipments = sorted(pending_shipments, key=shipment_priority, reverse=True)
         
         allocated_count = 0
         vehicles_used = set()
+        vehicle_assignments: dict[str, list[Shipment]] = {
+            v.id: [] for v in vehicles
+        }
         
-        # Assign shipments to vehicles
         for shipment in sorted_shipments:
-            assigned = False
+            best_vehicle = None
+            best_cost = float('inf')
             
-            # Try to find best fit vehicle (checking capacity and range)
-            for vehicle in sorted_vehicles:
+            for vehicle in vehicles:
                 # Check capacity constraint
-                if vehicle.current_load + shipment.weight <= vehicle.max_capacity:
-                    # Check range constraint (approximate: distance from vehicle to pickup + pickup to drop)
-                    # Calculate approximate distance: vehicle -> pickup -> drop
-                    dist_vehicle_pickup = calculate_distance(
-                        vehicle.latitude, vehicle.longitude,
-                        shipment.pickup_latitude, shipment.pickup_longitude
-                    )
-                    dist_pickup_drop = calculate_distance(
-                        shipment.pickup_latitude, shipment.pickup_longitude,
-                        shipment.drop_latitude, shipment.drop_longitude
-                    )
-                    total_approx_distance = dist_vehicle_pickup + dist_pickup_drop
-                    
-                    # Check if within range (allow some buffer)
-                    if total_approx_distance <= vehicle.max_range * 1.2:  # 20% buffer for TSP routing
-                        # Assign shipment to vehicle
-                        shipment.assigned_vehicle_id = vehicle.id
-                        shipment.status = ShipmentStatus.ASSIGNED
-                        vehicle.current_load += shipment.weight
-                        vehicles_used.add(vehicle.id)
-                        
-                        assigned = True
-                        allocated_count += 1
-                        break
+                if vehicle.current_load + shipment.weight > vehicle.max_capacity:
+                    continue
+                
+                # Check range constraint
+                dist_vehicle_pickup = calculate_distance(
+                    vehicle.latitude, vehicle.longitude,
+                    shipment.pickup_latitude, shipment.pickup_longitude
+                )
+                dist_pickup_drop = calculate_distance(
+                    shipment.pickup_latitude, shipment.pickup_longitude,
+                    shipment.drop_latitude, shipment.drop_longitude
+                )
+                total_approx_distance = dist_vehicle_pickup + dist_pickup_drop
+                
+                if total_approx_distance > vehicle.max_range * 1.2:
+                    continue
+                
+                # Calculate insertion cost
+                current_shipments = vehicle_assignments[vehicle.id]
+                insertion_cost = calculate_insertion_cost(vehicle, current_shipments, shipment)
+                
+                if insertion_cost < best_cost:
+                    best_cost = insertion_cost
+                    best_vehicle = vehicle
             
-            if not assigned:
-                # Cannot assign this shipment
-                pass
+            if best_vehicle:
+                shipment.assigned_vehicle_id = best_vehicle.id
+                shipment.status = ShipmentStatus.ASSIGNED
+                best_vehicle.current_load += shipment.weight
+                vehicles_used.add(best_vehicle.id)
+                vehicle_assignments[best_vehicle.id].append(shipment)
+                
+                allocated_count += 1
         
         await db.commit()
-        
-        # Note: Routes are optimized on-demand when requested via /vehicles/{id}/route
-        # using TSP with precedence logic (Pickup before Drop)
         
         unassigned_count = len(pending_shipments) - allocated_count
         
@@ -223,7 +337,7 @@ async def optimize_allocation(db: AsyncSession) -> OptimizeAllocationResponse:
             allocated=allocated_count,
             unassigned=unassigned_count,
             vehicles_used=len(vehicles_used),
-            message=f"Optimized allocation: {allocated_count} allocated, {unassigned_count} unassigned, {len(vehicles_used)} vehicles used"
+            message=f"Optimized allocation (Cheapest Insertion VRP): {allocated_count} allocated, {unassigned_count} unassigned, {len(vehicles_used)} vehicles used"
         )
     
     except Exception as e:

@@ -96,6 +96,17 @@ class OptimizeAllocationResponse(BaseModel):
     message: str
 
 
+class ManualAssignRequest(BaseModel):
+    shipment_id: str
+    vehicle_id: str
+
+
+class ManualAssignResponse(BaseModel):
+    message: str
+    shipment: ShipmentResponse
+    vehicle: VehicleResponse
+
+
 class RouteResponse(BaseModel):
     vehicle_id: str
     route: list[list[float]]  # [[lat, lon], [lat, lon], ...]

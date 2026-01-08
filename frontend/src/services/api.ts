@@ -25,10 +25,24 @@ api.interceptors.request.use(
   }
 )
 
-// Add error interceptor for better error messages
+// SL-2: Add retry logic for network errors and 503 responses
+const retryConfig = {
+  retries: 1,
+  retryDelay: 1000, // 1 second delay
+  retryCondition: (error: any) => {
+    // Retry on network errors or 503 Service Unavailable
+    return (
+      error.code === 'ERR_NETWORK' ||
+      error.message === 'Network Error' ||
+      error.response?.status === 503
+    )
+  }
+}
+
+// Add error interceptor with retry logic
 api.interceptors.response.use(
   (response) => response,
-  (error) => {
+  async (error) => {
     // Handle different types of network errors
     if (error.code === 'ECONNABORTED') {
       error.message = 'Request timeout - the server took too long to respond. Please try again.'
@@ -42,6 +56,16 @@ api.interceptors.response.use(
     } else if (error.response?.status === 503) {
       error.message = 'Service temporarily unavailable. Please try again in a moment.'
     }
+    
+    // SL-2: Retry logic for network errors and 503
+    if (retryConfig.retryCondition(error) && error.config && !error.config.__retryCount) {
+      error.config.__retryCount = (error.config.__retryCount || 0) + 1
+      if (error.config.__retryCount <= retryConfig.retries) {
+        await new Promise(resolve => setTimeout(resolve, retryConfig.retryDelay))
+        return api.request(error.config)
+      }
+    }
+    
     return Promise.reject(error)
   }
 )
@@ -183,5 +207,28 @@ export const deleteShipment = async (id: string): Promise<DeleteShipmentResponse
 // Optimize Allocation API
 export const optimizeAllocation = async (): Promise<OptimizeAllocationResponse> => {
   const response = await api.post<OptimizeAllocationResponse>('/allocate/optimize')
+  return response.data
+}
+
+// Manual Assignment API
+export interface ManualAssignRequest {
+  shipment_id: string
+  vehicle_id: string
+}
+
+export interface ManualAssignResponse {
+  message: string
+  shipment: Shipment
+  vehicle: Vehicle
+}
+
+export const manualAssignShipment = async (
+  shipmentId: string,
+  vehicleId: string
+): Promise<ManualAssignResponse> => {
+  const response = await api.post<ManualAssignResponse>('/allocations/manual', {
+    shipment_id: shipmentId,
+    vehicle_id: vehicleId
+  })
   return response.data
 }

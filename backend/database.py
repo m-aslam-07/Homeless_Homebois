@@ -2,9 +2,10 @@ from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sess
 from sqlalchemy.orm import declarative_base
 import os
 
+# SECURITY: Use environment variable for database URL (no hardcoded credentials)
 DATABASE_URL = os.getenv(
     "DATABASE_URL",
-    "postgresql+asyncpg://logitech:logitech123@postgres:5432/logitech_db"
+    "postgresql+asyncpg://logitech:CHANGE_ME_IN_PRODUCTION@postgres:5432/logitech_db"
 )
 
 engine = create_async_engine(DATABASE_URL, echo=True)

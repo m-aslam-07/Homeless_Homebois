@@ -4,6 +4,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, delete
 from contextlib import asynccontextmanager
 import uvicorn
+import logging
+import os
+
+# SL-3: Configure logging for observability
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 from database import init_db, get_db
 from models import Vehicle, Shipment, ShipmentStatus
@@ -13,19 +22,24 @@ from schemas import (
     GeocodeRequest, GeocodeResponse,
     AllocationResponse,
     OptimizeAllocationResponse,
-    RouteResponse
+    RouteResponse,
+    ManualAssignRequest, ManualAssignResponse
 )
 from services.geocoding import geocode_address
 from services.allocation import allocate_shipments, optimize_allocation
-from services.routing import calculate_route, calculate_route_with_precedence
+from services.routing import calculate_route, calculate_route_with_precedence, calculate_distance
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # SL-3: Log startup
+    logger.info("🚀 LogiTech Route Planning API starting up...")
     # Startup: Initialize database
     await init_db()
+    logger.info("✅ Database initialized successfully")
+    logger.info("✅ Application ready to accept requests")
     yield
     # Shutdown: Cleanup if needed
-    pass
+    logger.info("🛑 Application shutting down...")
 
 
 app = FastAPI(
@@ -55,6 +69,8 @@ async def health_check():
 
 
 # Vehicle Endpoints
+# SL-1: Auth Coverage - Public endpoint by design for hackathon
+# TODO: Add authentication dependency in production: dependencies=[Depends(get_current_user)]
 @app.post("/vehicles", response_model=VehicleResponse)
 async def create_vehicle(vehicle: VehicleCreate, db: AsyncSession = Depends(get_db)):
     """Create a new vehicle with validation and geocoding."""
@@ -105,6 +121,7 @@ async def create_vehicle(vehicle: VehicleCreate, db: AsyncSession = Depends(get_
     return db_vehicle
 
 
+# SL-1: Auth Coverage - Public endpoint by design for hackathon
 @app.get("/vehicles", response_model=list[VehicleResponse])
 async def get_vehicles(db: AsyncSession = Depends(get_db)):
     """Get all vehicles."""
@@ -161,6 +178,8 @@ async def delete_vehicle(vehicle_id: str, db: AsyncSession = Depends(get_db)):
 
 
 # Shipment Endpoints
+# SL-1: Auth Coverage - Public endpoint by design for hackathon
+# TODO: Add authentication dependency in production: dependencies=[Depends(get_current_user)]
 @app.post("/shipments", response_model=ShipmentResponse)
 async def create_shipment(shipment: ShipmentCreate, db: AsyncSession = Depends(get_db)):
     """Create a new shipment with India bounds validation and pickup/drop validation."""
@@ -240,8 +259,11 @@ async def geocode(request: GeocodeRequest):
         result = await geocode_address(request.address)
         return result
     except ValueError as e:
+        # SL-3: Log external API errors
+        logger.warning(f"⚠️ Geocoding failed for address '{request.address}': {str(e)}")
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
+        logger.error(f"❌ External API error during geocoding: {str(e)}")
         raise HTTPException(status_code=400, detail=f"Geocoding failed: {str(e)}")
 
 
@@ -249,6 +271,8 @@ async def geocode(request: GeocodeRequest):
 @app.post("/allocate", response_model=AllocationResponse)
 async def allocate(db: AsyncSession = Depends(get_db)):
     """Auto-allocate pending shipments to available vehicles using greedy bin packing."""
+    # SL-3: Log allocation start
+    logger.info("🔄 Allocation process started")
     try:
         result = await allocate_shipments(db)
         return result
@@ -260,11 +284,96 @@ async def allocate(db: AsyncSession = Depends(get_db)):
 @app.post("/allocate/optimize", response_model=OptimizeAllocationResponse)
 async def optimize_allocate(db: AsyncSession = Depends(get_db)):
     """Optimize allocation with TSP precedence logic: reset assignments, assign optimally, and optimize routes."""
+    # SL-3: Log optimization start
+    logger.info("🔄 Optimization process started")
     try:
         result = await optimize_allocation(db)
         return result
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Optimization failed: {str(e)}")
+
+
+# Manual Allocation Endpoint
+@app.post("/allocations/manual", response_model=ManualAssignResponse)
+async def manual_assign_shipment(
+    request: ManualAssignRequest,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Manually assign a specific shipment to a specific vehicle.
+    Validates capacity constraints before assignment.
+    """
+    # Fetch shipment
+    shipment_result = await db.execute(
+        select(Shipment).where(Shipment.id == request.shipment_id)
+    )
+    shipment = shipment_result.scalar_one_or_none()
+    
+    if not shipment:
+        raise HTTPException(status_code=404, detail="Shipment not found")
+    
+    # Fetch vehicle
+    vehicle_result = await db.execute(
+        select(Vehicle).where(Vehicle.id == request.vehicle_id)
+    )
+    vehicle = vehicle_result.scalar_one_or_none()
+    
+    if not vehicle:
+        raise HTTPException(status_code=404, detail="Vehicle not found")
+    
+    # Validate capacity constraint
+    if vehicle.current_load + shipment.weight > vehicle.max_capacity:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Vehicle '{vehicle.name}' does not have capacity for this shipment. "
+                   f"Available: {vehicle.max_capacity - vehicle.current_load:.1f} kg, "
+                   f"Required: {shipment.weight:.1f} kg"
+        )
+    
+    # Validate range constraint (approximate)
+    dist_vehicle_pickup = calculate_distance(
+        vehicle.latitude, vehicle.longitude,
+        shipment.pickup_latitude, shipment.pickup_longitude
+    )
+    dist_pickup_drop = calculate_distance(
+        shipment.pickup_latitude, shipment.pickup_longitude,
+        shipment.drop_latitude, shipment.drop_longitude
+    )
+    total_approx_distance = dist_vehicle_pickup + dist_pickup_drop
+    
+    if total_approx_distance > vehicle.max_range * 1.2:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Vehicle '{vehicle.name}' does not have sufficient range for this shipment. "
+                   f"Required: {total_approx_distance:.1f} km, "
+                   f"Available: {vehicle.max_range:.1f} km"
+        )
+    
+    # If shipment was previously assigned, unassign it first
+    if shipment.assigned_vehicle_id:
+        old_vehicle_result = await db.execute(
+            select(Vehicle).where(Vehicle.id == shipment.assigned_vehicle_id)
+        )
+        old_vehicle = old_vehicle_result.scalar_one_or_none()
+        if old_vehicle:
+            old_vehicle.current_load = max(0.0, old_vehicle.current_load - shipment.weight)
+    
+    # Assign shipment to vehicle
+    shipment.assigned_vehicle_id = vehicle.id
+    shipment.status = ShipmentStatus.ASSIGNED
+    vehicle.current_load += shipment.weight
+    
+    await db.commit()
+    await db.refresh(shipment)
+    await db.refresh(vehicle)
+    
+    logger.info(f"✅ Manual assignment: Shipment {shipment.id} → Vehicle {vehicle.name}")
+    
+    return ManualAssignResponse(
+        message=f"Shipment assigned to {vehicle.name} successfully",
+        shipment=ShipmentResponse.model_validate(shipment),
+        vehicle=VehicleResponse.model_validate(vehicle)
+    )
 
 
 # Route Optimization Endpoint

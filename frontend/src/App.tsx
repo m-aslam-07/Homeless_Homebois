@@ -36,6 +36,7 @@ function App() {
   const [vehicles, setVehicles] = useState<Vehicle[]>([])
   const [shipments, setShipments] = useState<Shipment[]>([])
   const [selectedVehicleId, setSelectedVehicleId] = useState<string | null>(null)
+  const [selectedShipmentId, setSelectedShipmentId] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
   const [toast, setToast] = useState<{ message: string; type: 'success' | 'error' } | null>(null)
 
@@ -71,14 +72,14 @@ function App() {
 
   return (
     <div className="h-screen flex flex-col">
-      <header className="h-14 bg-primary text-white shadow-lg px-4 py-2">
+      <header className="h-20 bg-primary text-white shadow-lg px-6 py-4 pr-6">
         <div className="flex items-center justify-between h-full">
           <div>
             <h1 className="text-lg font-bold">Route Planning & Resource Allocation</h1>
             <p className="text-xs text-white/90">India-Only Operations | Production-Grade System</p>
           </div>
           <div className="flex items-center gap-4">
-            <AllocationButton onAllocate={loadData} onToast={showToast} />
+            <AllocationButton onAllocate={loadData} onToast={showToast} compact={true} />
           </div>
         </div>
       </header>
@@ -115,6 +116,7 @@ function App() {
                 vehicles={vehicles}
                 shipments={shipments}
                 selectedVehicleId={selectedVehicleId}
+                selectedShipmentId={selectedShipmentId}
               />
             )}
           </div>
@@ -130,6 +132,8 @@ function App() {
               onShipmentsUpdate={setShipments}
               selectedVehicleId={selectedVehicleId}
               onVehicleSelect={setSelectedVehicleId}
+              selectedShipmentId={selectedShipmentId}
+              onShipmentSelect={setSelectedShipmentId}
             />
           </div>
         </main>

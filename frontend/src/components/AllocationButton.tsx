@@ -4,9 +4,10 @@ import { optimizeAllocation } from '../services/api'
 interface AllocationButtonProps {
   onAllocate: () => void
   onToast: (message: string, type: 'success' | 'error') => void
+  compact?: boolean
 }
 
-export default function AllocationButton({ onAllocate, onToast }: AllocationButtonProps) {
+export default function AllocationButton({ onAllocate, onToast, compact = false }: AllocationButtonProps) {
   const [loading, setLoading] = useState(false)
 
   const handleOptimize = async () => {
@@ -23,6 +24,30 @@ export default function AllocationButton({ onAllocate, onToast }: AllocationButt
     }
   }
 
+  // Compact mode for header
+  if (compact) {
+    return (
+      <button
+        onClick={handleOptimize}
+        disabled={loading}
+        className="px-4 py-2 bg-emerald-600 hover:bg-emerald-700 text-white text-sm font-medium rounded-lg shadow-md transition-colors flex items-center gap-2 disabled:bg-gray-400 disabled:cursor-not-allowed"
+      >
+        {loading ? (
+          <>
+            <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-white"></div>
+            <span>Allocating...</span>
+          </>
+        ) : (
+          <>
+            <span>⚡</span>
+            <span>Auto-Allocate</span>
+          </>
+        )}
+      </button>
+    )
+  }
+
+  // Full card mode for sidebar
   return (
     <div className="bg-white p-4 rounded-lg shadow">
       <h2 className="text-lg font-semibold mb-3">Smart Allocation</h2>

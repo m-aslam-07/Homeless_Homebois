@@ -25,16 +25,19 @@ interface MapViewProps {
   vehicles: Vehicle[]
   shipments: Shipment[]
   selectedVehicleId: string | null
+  selectedShipmentId: string | null
 }
 
-// Component to update map bounds when vehicle is selected (Focus Mode)
+// Component to update map bounds when vehicle or shipment is selected (Focus Mode)
 function MapBoundsUpdater({ 
-  selectedVehicleId, 
+  selectedVehicleId,
+  selectedShipmentId,
   vehicles, 
   shipments, 
   route 
 }: { 
   selectedVehicleId: string | null
+  selectedShipmentId: string | null
   vehicles: Vehicle[]
   shipments: Shipment[]
   route: RouteResponse | null
@@ -42,7 +45,19 @@ function MapBoundsUpdater({
   const map = useMap()
   
   useEffect(() => {
-    if (selectedVehicleId) {
+    // Priority: Shipment selection overrides vehicle selection
+    if (selectedShipmentId) {
+      const shipment = shipments.find(s => s.id === selectedShipmentId)
+      if (shipment) {
+        // Focus on shipment's pickup and drop locations
+        const points: [number, number][] = [
+          [shipment.pickup_latitude, shipment.pickup_longitude],
+          [shipment.drop_latitude, shipment.drop_longitude]
+        ]
+        const bounds = L.latLngBounds(points)
+        map.fitBounds(bounds, { padding: [100, 100], maxZoom: 10 })
+      }
+    } else if (selectedVehicleId) {
       const vehicle = vehicles.find(v => v.id === selectedVehicleId)
       if (vehicle) {
         // If route is available, use it for more accurate bounds
@@ -67,15 +82,15 @@ function MapBoundsUpdater({
         }
       }
     } else {
-      // Reset to India view when no vehicle selected
+      // Reset to India view when nothing selected
       map.setView([20.59, 78.96], 5)
     }
-  }, [selectedVehicleId, vehicles, shipments, route, map])
+  }, [selectedVehicleId, selectedShipmentId, vehicles, shipments, route, map])
   
   return null
 }
 
-export default function MapView({ vehicles, shipments, selectedVehicleId }: MapViewProps) {
+export default function MapView({ vehicles, shipments, selectedVehicleId, selectedShipmentId }: MapViewProps) {
   const [route, setRoute] = useState<RouteResponse | null>(null)
   const [loadingRoute, setLoadingRoute] = useState(false)
   const [usePolylineFallback, setUsePolylineFallback] = useState(false)
@@ -130,6 +145,7 @@ export default function MapView({ vehicles, shipments, selectedVehicleId }: MapV
         
         <MapBoundsUpdater
           selectedVehicleId={selectedVehicleId}
+          selectedShipmentId={selectedShipmentId}
           vehicles={vehicles}
           shipments={shipments}
           route={route}
@@ -231,8 +247,76 @@ export default function MapView({ vehicles, shipments, selectedVehicleId }: MapV
           </>
         )}
 
+        {/* Preview Route for Selected Shipment */}
+        {selectedShipmentId && !selectedVehicleId && (() => {
+          const selectedShipment = shipments.find(s => s.id === selectedShipmentId)
+          if (!selectedShipment) return null
+          
+          // Green marker for pickup
+          const pickupPreviewIcon = new L.Icon({
+            iconUrl: 'https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-green.png',
+            iconSize: [35, 50],
+            iconAnchor: [17, 50],
+            popupAnchor: [1, -34],
+          })
+          
+          // Red marker for drop
+          const dropPreviewIcon = new L.Icon({
+            iconUrl: 'https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-red.png',
+            iconSize: [35, 50],
+            iconAnchor: [17, 50],
+            popupAnchor: [1, -34],
+          })
+          
+          return (
+            <>
+              {/* Pickup Marker (Green, Larger) */}
+              <Marker
+                position={[selectedShipment.pickup_latitude, selectedShipment.pickup_longitude]}
+                icon={pickupPreviewIcon}
+              >
+                <Popup>
+                  <div className="font-semibold text-secondary">📍 Pickup Location</div>
+                  <div className="text-sm">{selectedShipment.pickup_address}</div>
+                  <div className="text-sm">Weight: {selectedShipment.weight} kg</div>
+                  <div className="mt-2 text-xs bg-green-100 text-green-800 px-2 py-1 rounded">
+                    ✨ Preview Route Active
+                  </div>
+                </Popup>
+              </Marker>
+              
+              {/* Drop Marker (Red, Larger) */}
+              <Marker
+                position={[selectedShipment.drop_latitude, selectedShipment.drop_longitude]}
+                icon={dropPreviewIcon}
+              >
+                <Popup>
+                  <div className="font-semibold text-red-600">📍 Drop Location</div>
+                  <div className="text-sm">{selectedShipment.drop_address}</div>
+                  <div className="text-sm">Weight: {selectedShipment.weight} kg</div>
+                  <div className="mt-2 text-xs bg-red-100 text-red-800 px-2 py-1 rounded">
+                    ✨ Preview Route Active
+                  </div>
+                </Popup>
+              </Marker>
+              
+              {/* Dotted Preview Route Line */}
+              <Polyline
+                positions={[
+                  [selectedShipment.pickup_latitude, selectedShipment.pickup_longitude],
+                  [selectedShipment.drop_latitude, selectedShipment.drop_longitude]
+                ]}
+                color="#3b82f6"
+                weight={3}
+                opacity={0.8}
+                dashArray="10, 10"
+              />
+            </>
+          )
+        })()}
+
         {/* Fallback: Show regular markers when no route is selected */}
-        {(!route || !selectedVehicleId) && displayShipments.map(shipment => {
+        {(!route || !selectedVehicleId) && !selectedShipmentId && displayShipments.map(shipment => {
           // Green marker for pickup location
           const pickupIcon = new L.Icon({
             iconUrl: 'https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-green.png',

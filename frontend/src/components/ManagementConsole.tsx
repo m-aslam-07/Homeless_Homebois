@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { Vehicle, Shipment } from '../App'
 import { deleteVehicle, deleteShipment } from '../services/api'
+import ManualAssignModal from './ManualAssignModal'
 
 interface ManagementConsoleProps {
   vehicles: Vehicle[]
@@ -11,6 +12,8 @@ interface ManagementConsoleProps {
   onShipmentsUpdate: (shipments: Shipment[]) => void
   selectedVehicleId: string | null
   onVehicleSelect: (vehicleId: string | null) => void
+  selectedShipmentId: string | null
+  onShipmentSelect: (shipmentId: string | null) => void
 }
 
 type TabType = 'vehicles' | 'shipments' | 'allocations'
@@ -23,10 +26,13 @@ export default function ManagementConsole({
   onVehiclesUpdate,
   onShipmentsUpdate,
   selectedVehicleId,
-  onVehicleSelect
+  onVehicleSelect,
+  selectedShipmentId,
+  onShipmentSelect
 }: ManagementConsoleProps) {
   const [activeTab, setActiveTab] = useState<TabType>('vehicles')
   const [deleting, setDeleting] = useState<string | null>(null)
+  const [manualAssignShipmentId, setManualAssignShipmentId] = useState<string | null>(null)
 
   const handleVehicleRowClick = (vehicleId: string, e: React.MouseEvent) => {
     // Don't trigger if clicking on the delete button
@@ -67,6 +73,20 @@ export default function ManagementConsole({
     }
   }
 
+  const handleShipmentRowClick = (shipmentId: string, e: React.MouseEvent) => {
+    // Don't trigger if clicking on the delete button
+    if ((e.target as HTMLElement).closest('button')) {
+      return
+    }
+    
+    // Toggle focus mode
+    if (selectedShipmentId === shipmentId) {
+      onShipmentSelect(null) // Clear focus
+    } else {
+      onShipmentSelect(shipmentId) // Focus on this shipment
+    }
+  }
+
   const handleDeleteShipment = async (shipmentId: string, pickupAddress: string) => {
     if (!window.confirm(`Are you sure you want to delete shipment from "${pickupAddress}"?`)) {
       return
@@ -83,6 +103,10 @@ export default function ManagementConsole({
         onShipmentsUpdate(response.shipments)
       }
       onToast(`Shipment from "${pickupAddress}" deleted successfully.`, 'success')
+      // Clear selection if deleted shipment was selected
+      if (selectedShipmentId === shipmentId) {
+        onShipmentSelect(null)
+      }
       // Also refresh to ensure consistency
       onDataChange()
     } catch (error: any) {
@@ -241,12 +265,26 @@ export default function ManagementConsole({
                     const assignedVehicle = shipment.assigned_vehicle_id
                       ? vehicles.find(v => v.id === shipment.assigned_vehicle_id)
                       : null
+                    const isSelected = selectedShipmentId === shipment.id
                     
                     return (
-                      <tr key={shipment.id} className="border-b border-gray-100 hover:bg-accent/50">
+                      <tr 
+                        key={shipment.id} 
+                        onClick={(e) => handleShipmentRowClick(shipment.id, e)}
+                        className={`border-b border-gray-100 cursor-pointer transition-colors ${
+                          isSelected 
+                            ? 'bg-accent-light hover:bg-accent border-l-4 border-l-primary' 
+                            : 'hover:bg-accent/50'
+                        }`}
+                      >
                         <td className="py-2 px-3 text-gray-600 font-mono text-xs">{shipment.id.substring(0, 8)}...</td>
                         <td className="py-2 px-3 text-gray-700 max-w-xs truncate" title={shipment.pickup_address}>
-                          {shipment.pickup_address}
+                          <div className="flex items-center gap-2">
+                            {shipment.pickup_address}
+                            {isSelected && (
+                              <span className="text-xs bg-primary text-white px-2 py-0.5 rounded">Focused</span>
+                            )}
+                          </div>
                         </td>
                         <td className="py-2 px-3 text-gray-700 max-w-xs truncate" title={shipment.drop_address}>
                           {shipment.drop_address}
@@ -265,20 +303,37 @@ export default function ManagementConsole({
                           {assignedVehicle ? assignedVehicle.name : '-'}
                         </td>
                         <td className="py-2 px-3 text-center">
-                          <button
-                            onClick={() => handleDeleteShipment(shipment.id, shipment.pickup_address)}
-                            disabled={deleting === shipment.id}
-                            className="text-red-600 hover:text-red-700 disabled:text-gray-400 disabled:cursor-not-allowed"
-                            title="Delete shipment"
-                          >
-                            {deleting === shipment.id ? (
-                              <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-red-600"></div>
-                            ) : (
-                              <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
-                              </svg>
+                          <div className="flex items-center justify-center gap-2">
+                            {shipment.status === 'PENDING' && (
+                              <button
+                                onClick={(e) => {
+                                  e.stopPropagation()
+                                  setManualAssignShipmentId(shipment.id)
+                                }}
+                                className="px-3 py-1 text-sm bg-blue-600 hover:bg-blue-700 text-white rounded-md transition-colors disabled:bg-gray-400 disabled:cursor-not-allowed"
+                                title="Assign Shipment"
+                              >
+                                Assign
+                              </button>
                             )}
-                          </button>
+                            <button
+                              onClick={(e) => {
+                                e.stopPropagation()
+                                handleDeleteShipment(shipment.id, shipment.pickup_address)
+                              }}
+                              disabled={deleting === shipment.id}
+                              className="text-red-600 hover:text-red-700 disabled:text-gray-400 disabled:cursor-not-allowed"
+                              title="Delete shipment"
+                            >
+                              {deleting === shipment.id ? (
+                                <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-red-600"></div>
+                              ) : (
+                                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                                </svg>
+                              )}
+                            </button>
+                          </div>
                         </td>
                       </tr>
                     )
@@ -319,6 +374,23 @@ export default function ManagementConsole({
           </div>
         )}
       </div>
+
+      {/* Manual Assign Modal */}
+      {manualAssignShipmentId && (() => {
+        const shipment = shipments.find(s => s.id === manualAssignShipmentId)
+        if (!shipment) return null
+        
+        return (
+          <ManualAssignModal
+            shipmentId={shipment.id}
+            shipmentWeight={shipment.weight}
+            vehicles={vehicles}
+            onClose={() => setManualAssignShipmentId(null)}
+            onSuccess={onDataChange}
+            onToast={onToast}
+          />
+        )
+      })()}
     </div>
   )
 }

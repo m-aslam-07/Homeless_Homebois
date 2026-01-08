@@ -3,9 +3,9 @@ services:
     image: postgres:15-alpine
     container_name: logitech_postgres
     environment:
-      POSTGRES_USER: logitech
-      POSTGRES_PASSWORD: logitech123
-      POSTGRES_DB: logitech_db
+      POSTGRES_USER: ${POSTGRES_USER:-logitech}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-CHANGE_ME_IN_PRODUCTION}
+      POSTGRES_DB: ${POSTGRES_DB:-logitech_db}
     ports:
       - "5432:5432"
     volumes:
@@ -25,7 +25,7 @@ services:
     ports:
       - "8000:8000"  # Explicit port mapping: host:container
     environment:
-      DATABASE_URL: postgresql+asyncpg://logitech:logitech123@postgres:5432/logitech_db
+      DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://${POSTGRES_USER:-logitech}:${POSTGRES_PASSWORD:-CHANGE_ME_IN_PRODUCTION}@postgres:5432/${POSTGRES_DB:-logitech_db}}
     depends_on:
       postgres:
         condition: service_healthy

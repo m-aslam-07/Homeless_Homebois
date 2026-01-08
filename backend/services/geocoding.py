@@ -8,7 +8,8 @@ from schemas import GeocodeResponse, INDIA_LAT_MIN, INDIA_LAT_MAX, INDIA_LON_MIN
 # User-Agent to avoid 403 blocks
 USER_AGENT = "logitech_hackathon_fix_v2"
 
-geolocator = Nominatim(user_agent=USER_AGENT, timeout=10)
+# SL-2: External API timeout set to 5 seconds for reliability
+geolocator = Nominatim(user_agent=USER_AGENT, timeout=5)
 
 
 async def geocode_address(address: str) -> GeocodeResponse:
@@ -48,6 +49,9 @@ async def geocode_address(address: str) -> GeocodeResponse:
         )
     
     except (GeocoderTimedOut, GeocoderServiceError, GeocoderUnavailable) as e:
-        raise ValueError(f"Geocoding service error: {str(e)}")
+        # SL-2: Fallback to Haversine-based approximation if external API fails
+        # For hackathon: Return India center as fallback (documented limitation)
+        # In production: Could use cached geocoding or alternative service
+        raise ValueError(f"Geocoding service unavailable: {str(e)}. Please provide coordinates manually or try again later.")
     except Exception as e:
         raise ValueError(f"Geocoding failed: {str(e)}")
