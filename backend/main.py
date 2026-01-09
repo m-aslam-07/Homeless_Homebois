@@ -1,4 +1,5 @@
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, Security, status
+from fastapi.security.api_key import APIKeyHeader
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, delete
@@ -29,16 +30,41 @@ from services.geocoding import geocode_address
 from services.allocation import allocate_shipments, optimize_allocation
 from services.routing import calculate_route, calculate_route_with_precedence, calculate_distance
 
+# --- SECURITY CONFIGURATION ---
+API_KEY_NAME = "X-API-Key"
+api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=True)
+
+# Define secure keys (In production, these come from a DB or Vault)
+# Hackathon tip: Set these in your Render Environment Variables
+ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "logitech-admin-secret-123")
+USER_API_KEY = os.getenv("USER_API_KEY", "logitech-user-view-456")
+
+async def get_api_key(api_key_header: str = Security(api_key_header)):
+    """Validates that a valid API key is present."""
+    if api_key_header in [ADMIN_API_KEY, USER_API_KEY]:
+        return api_key_header
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail="Could not validate credentials"
+    )
+
+async def verify_admin(api_key_header: str = Security(api_key_header)):
+    """Role-Based Access: Only allows requests with the Admin API Key."""
+    if api_key_header == ADMIN_API_KEY:
+        return True
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail="Admin privileges required for this operation"
+    )
+# -----------------------------
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # SL-3: Log startup
     logger.info("🚀 LogiTech Route Planning API starting up...")
-    # Startup: Initialize database
     await init_db()
     logger.info("✅ Database initialized successfully")
-    logger.info("✅ Application ready to accept requests")
     yield
-    # Shutdown: Cleanup if needed
     logger.info("🛑 Application shutting down...")
 
 
@@ -48,13 +74,16 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-# CORS Configuration - Allow ALL origins for hackathon (unbreakable)
+# CORS Configuration
+origins_env = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000,http://localhost:5173")
+origins = [origin.strip() for origin in origins_env.split(",")]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allow all origins for hackathon
+    allow_origins=origins,
     allow_credentials=True,
-    allow_methods=["*"],  # Allow all HTTP methods
-    allow_headers=["*"],   # Allow all headers
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
@@ -62,50 +91,42 @@ app.add_middleware(
 async def root():
     return {"message": "LogiTech Route Planning API", "status": "operational"}
 
-
+# Health check usually remains public for load balancers
 @app.get("/health")
 async def health_check():
     return {"status": "healthy"}
 
 
 # Vehicle Endpoints
-# SL-1: Auth Coverage - Public endpoint by design for hackathon
-# TODO: Add authentication dependency in production: dependencies=[Depends(get_current_user)]
-@app.post("/vehicles", response_model=VehicleResponse)
+
+# SECURED: Creation requires Admin privileges
+@app.post("/vehicles", response_model=VehicleResponse, dependencies=[Depends(verify_admin)])
 async def create_vehicle(vehicle: VehicleCreate, db: AsyncSession = Depends(get_db)):
-    """Create a new vehicle with validation and geocoding."""
-    # Additional validation: current_load <= max_capacity
+    """Create a new vehicle (Admin Only)."""
     if vehicle.current_load > vehicle.max_capacity:
         raise HTTPException(
             status_code=400,
             detail="current_load cannot exceed max_capacity"
         )
     
-    # Geocode current_address if provided
+    # Geocoding logic...
     latitude = vehicle.latitude
     longitude = vehicle.longitude
     current_address = vehicle.current_address
     
     if current_address:
         try:
-            # Geocode the address
             geocode_result = await geocode_address(current_address)
             latitude = geocode_result.latitude
             longitude = geocode_result.longitude
-            current_address = geocode_result.address  # Use normalized address from geocoder
+            current_address = geocode_result.address
         except Exception as e:
-            # If geocoding fails, return 400 Bad Request
-            raise HTTPException(
-                status_code=400,
-                detail=f"Geocoding failed for address '{current_address}': {str(e)}"
-            )
+            raise HTTPException(status_code=400, detail=str(e))
     elif latitude is None or longitude is None:
-        # If no address and no coordinates provided, use default India center
         latitude = 20.59
         longitude = 78.96
         current_address = None
     
-    # Create vehicle with geocoded coordinates
     db_vehicle = Vehicle(
         name=vehicle.name,
         max_capacity=vehicle.max_capacity,
@@ -121,18 +142,18 @@ async def create_vehicle(vehicle: VehicleCreate, db: AsyncSession = Depends(get_
     return db_vehicle
 
 
-# SL-1: Auth Coverage - Public endpoint by design for hackathon
-@app.get("/vehicles", response_model=list[VehicleResponse])
+# SECURED: Read requires at least a valid User key
+@app.get("/vehicles", response_model=list[VehicleResponse], dependencies=[Depends(get_api_key)])
 async def get_vehicles(db: AsyncSession = Depends(get_db)):
-    """Get all vehicles."""
+    """Get all vehicles (Authenticated)."""
     result = await db.execute(select(Vehicle))
     vehicles = result.scalars().all()
     return vehicles
 
 
-@app.get("/vehicles/{vehicle_id}", response_model=VehicleResponse)
+@app.get("/vehicles/{vehicle_id}", response_model=VehicleResponse, dependencies=[Depends(get_api_key)])
 async def get_vehicle(vehicle_id: str, db: AsyncSession = Depends(get_db)):
-    """Get a specific vehicle by ID."""
+    """Get a specific vehicle (Authenticated)."""
     result = await db.execute(select(Vehicle).where(Vehicle.id == vehicle_id))
     vehicle = result.scalar_one_or_none()
     if not vehicle:
@@ -140,15 +161,16 @@ async def get_vehicle(vehicle_id: str, db: AsyncSession = Depends(get_db)):
     return vehicle
 
 
-@app.delete("/vehicles/{vehicle_id}", response_model=dict)
+# SECURED: CRITICAL - Deletion requires strict Admin privileges
+@app.delete("/vehicles/{vehicle_id}", response_model=dict, dependencies=[Depends(verify_admin)])
 async def delete_vehicle(vehicle_id: str, db: AsyncSession = Depends(get_db)):
-    """Delete a vehicle and gracefully unassign its shipments. Returns updated lists."""
+    """Delete a vehicle (Admin Only)."""
     result = await db.execute(select(Vehicle).where(Vehicle.id == vehicle_id))
     vehicle = result.scalar_one_or_none()
     if not vehicle:
         raise HTTPException(status_code=404, detail="Vehicle not found")
     
-    # Unassign all shipments assigned to this vehicle
+    # Unassign logic...
     shipments_result = await db.execute(
         select(Shipment).where(Shipment.assigned_vehicle_id == vehicle_id)
     )
@@ -158,32 +180,28 @@ async def delete_vehicle(vehicle_id: str, db: AsyncSession = Depends(get_db)):
         shipment.assigned_vehicle_id = None
         shipment.status = ShipmentStatus.PENDING
     
-    # Delete the vehicle using SQLAlchemy async delete statement
     await db.execute(delete(Vehicle).where(Vehicle.id == vehicle_id))
     await db.commit()
     
     # Return updated lists
     vehicles_result = await db.execute(select(Vehicle))
     vehicles = vehicles_result.scalars().all()
-    
     shipments_result = await db.execute(select(Shipment))
     shipments = shipments_result.scalars().all()
     
     return {
         "message": f"Vehicle deleted successfully. {len(assigned_shipments)} shipments unassigned.",
-        "unassigned_shipments": len(assigned_shipments),
         "vehicles": vehicles,
         "shipments": shipments
     }
 
 
 # Shipment Endpoints
-# SL-1: Auth Coverage - Public endpoint by design for hackathon
-# TODO: Add authentication dependency in production: dependencies=[Depends(get_current_user)]
-@app.post("/shipments", response_model=ShipmentResponse)
+
+# SECURED: Creation requires Admin privileges
+@app.post("/shipments", response_model=ShipmentResponse, dependencies=[Depends(verify_admin)])
 async def create_shipment(shipment: ShipmentCreate, db: AsyncSession = Depends(get_db)):
-    """Create a new shipment with India bounds validation and pickup/drop validation."""
-    # Validate pickup and drop are different
+    """Create a new shipment (Admin Only)."""
     if (shipment.pickup_latitude == shipment.drop_latitude and 
         shipment.pickup_longitude == shipment.drop_longitude):
         raise HTTPException(
@@ -198,17 +216,17 @@ async def create_shipment(shipment: ShipmentCreate, db: AsyncSession = Depends(g
     return db_shipment
 
 
-@app.get("/shipments", response_model=list[ShipmentResponse])
+@app.get("/shipments", response_model=list[ShipmentResponse], dependencies=[Depends(get_api_key)])
 async def get_shipments(db: AsyncSession = Depends(get_db)):
-    """Get all shipments."""
+    """Get all shipments (Authenticated)."""
     result = await db.execute(select(Shipment))
     shipments = result.scalars().all()
     return shipments
 
 
-@app.get("/shipments/{shipment_id}", response_model=ShipmentResponse)
+@app.get("/shipments/{shipment_id}", response_model=ShipmentResponse, dependencies=[Depends(get_api_key)])
 async def get_shipment(shipment_id: str, db: AsyncSession = Depends(get_db)):
-    """Get a specific shipment by ID."""
+    """Get specific shipment (Authenticated)."""
     result = await db.execute(select(Shipment).where(Shipment.id == shipment_id))
     shipment = result.scalar_one_or_none()
     if not shipment:
@@ -216,15 +234,15 @@ async def get_shipment(shipment_id: str, db: AsyncSession = Depends(get_db)):
     return shipment
 
 
-@app.delete("/shipments/{shipment_id}", response_model=dict)
+# SECURED: Deletion requires Admin privileges
+@app.delete("/shipments/{shipment_id}", response_model=dict, dependencies=[Depends(verify_admin)])
 async def delete_shipment(shipment_id: str, db: AsyncSession = Depends(get_db)):
-    """Delete a shipment. If assigned, remove it from vehicle's route logic."""
+    """Delete shipment (Admin Only)."""
     result = await db.execute(select(Shipment).where(Shipment.id == shipment_id))
     shipment = result.scalar_one_or_none()
     if not shipment:
         raise HTTPException(status_code=404, detail="Shipment not found")
     
-    # If shipment is assigned to a vehicle, update vehicle's current_load
     if shipment.assigned_vehicle_id:
         vehicle_result = await db.execute(
             select(Vehicle).where(Vehicle.id == shipment.assigned_vehicle_id)
@@ -233,14 +251,11 @@ async def delete_shipment(shipment_id: str, db: AsyncSession = Depends(get_db)):
         if vehicle:
             vehicle.current_load = max(0.0, vehicle.current_load - shipment.weight)
     
-    # Delete the shipment
     await db.execute(delete(Shipment).where(Shipment.id == shipment_id))
     await db.commit()
     
-    # Return updated lists
     vehicles_result = await db.execute(select(Vehicle))
     vehicles = vehicles_result.scalars().all()
-    
     shipments_result = await db.execute(select(Shipment))
     shipments = shipments_result.scalars().all()
     
@@ -252,26 +267,24 @@ async def delete_shipment(shipment_id: str, db: AsyncSession = Depends(get_db)):
 
 
 # Geocoding Endpoint
-@app.post("/geocode", response_model=GeocodeResponse)
+@app.post("/geocode", response_model=GeocodeResponse, dependencies=[Depends(get_api_key)])
 async def geocode(request: GeocodeRequest):
-    """Convert address to coordinates with India bounds validation."""
+    """Convert address to coordinates (Authenticated)."""
     try:
         result = await geocode_address(request.address)
         return result
     except ValueError as e:
-        # SL-3: Log external API errors
-        logger.warning(f"⚠️ Geocoding failed for address '{request.address}': {str(e)}")
+        logger.warning(f"⚠️ Geocoding failed: {str(e)}")
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        logger.error(f"❌ External API error during geocoding: {str(e)}")
+        logger.error(f"❌ API error: {str(e)}")
         raise HTTPException(status_code=400, detail=f"Geocoding failed: {str(e)}")
 
 
-# Allocation Endpoint
-@app.post("/allocate", response_model=AllocationResponse)
+# Allocation Endpoint - Secured for Admin (Resource intensive)
+@app.post("/allocate", response_model=AllocationResponse, dependencies=[Depends(verify_admin)])
 async def allocate(db: AsyncSession = Depends(get_db)):
-    """Auto-allocate pending shipments to available vehicles using greedy bin packing."""
-    # SL-3: Log allocation start
+    """Auto-allocate shipments (Admin Only)."""
     logger.info("🔄 Allocation process started")
     try:
         result = await allocate_shipments(db)
@@ -280,11 +293,9 @@ async def allocate(db: AsyncSession = Depends(get_db)):
         raise HTTPException(status_code=400, detail=f"Allocation failed: {str(e)}")
 
 
-# Optimize Allocation Endpoint (Multi-Objective with TSP Precedence)
-@app.post("/allocate/optimize", response_model=OptimizeAllocationResponse)
+@app.post("/allocate/optimize", response_model=OptimizeAllocationResponse, dependencies=[Depends(verify_admin)])
 async def optimize_allocate(db: AsyncSession = Depends(get_db)):
-    """Optimize allocation with TSP precedence logic: reset assignments, assign optimally, and optimize routes."""
-    # SL-3: Log optimization start
+    """Optimize allocation (Admin Only)."""
     logger.info("🔄 Optimization process started")
     try:
         result = await optimize_allocation(db)
@@ -293,72 +304,31 @@ async def optimize_allocate(db: AsyncSession = Depends(get_db)):
         raise HTTPException(status_code=400, detail=f"Optimization failed: {str(e)}")
 
 
-# Manual Allocation Endpoint
-@app.post("/allocations/manual", response_model=ManualAssignResponse)
-async def manual_assign_shipment(
-    request: ManualAssignRequest,
-    db: AsyncSession = Depends(get_db)
-):
-    """
-    Manually assign a specific shipment to a specific vehicle.
-    Validates capacity constraints before assignment.
-    """
-    # Fetch shipment
-    shipment_result = await db.execute(
-        select(Shipment).where(Shipment.id == request.shipment_id)
-    )
+@app.post("/allocations/manual", response_model=ManualAssignResponse, dependencies=[Depends(verify_admin)])
+async def manual_assign_shipment(request: ManualAssignRequest, db: AsyncSession = Depends(get_db)):
+    """Manual assignment (Admin Only)."""
+    # ... (Keep existing manual assignment logic) ...
+    shipment_result = await db.execute(select(Shipment).where(Shipment.id == request.shipment_id))
     shipment = shipment_result.scalar_one_or_none()
-    
-    if not shipment:
-        raise HTTPException(status_code=404, detail="Shipment not found")
-    
-    # Fetch vehicle
-    vehicle_result = await db.execute(
-        select(Vehicle).where(Vehicle.id == request.vehicle_id)
-    )
+    if not shipment: raise HTTPException(status_code=404, detail="Shipment not found")
+
+    vehicle_result = await db.execute(select(Vehicle).where(Vehicle.id == request.vehicle_id))
     vehicle = vehicle_result.scalar_one_or_none()
-    
-    if not vehicle:
-        raise HTTPException(status_code=404, detail="Vehicle not found")
-    
-    # Validate capacity constraint
+    if not vehicle: raise HTTPException(status_code=404, detail="Vehicle not found")
+
     if vehicle.current_load + shipment.weight > vehicle.max_capacity:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Vehicle '{vehicle.name}' does not have capacity for this shipment. "
-                   f"Available: {vehicle.max_capacity - vehicle.current_load:.1f} kg, "
-                   f"Required: {shipment.weight:.1f} kg"
-        )
-    
-    # Validate range constraint (approximate)
-    dist_vehicle_pickup = calculate_distance(
-        vehicle.latitude, vehicle.longitude,
-        shipment.pickup_latitude, shipment.pickup_longitude
-    )
-    dist_pickup_drop = calculate_distance(
-        shipment.pickup_latitude, shipment.pickup_longitude,
-        shipment.drop_latitude, shipment.drop_longitude
-    )
-    total_approx_distance = dist_vehicle_pickup + dist_pickup_drop
-    
-    if total_approx_distance > vehicle.max_range * 1.2:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Vehicle '{vehicle.name}' does not have sufficient range for this shipment. "
-                   f"Required: {total_approx_distance:.1f} km, "
-                   f"Available: {vehicle.max_range:.1f} km"
-        )
-    
-    # If shipment was previously assigned, unassign it first
+        raise HTTPException(status_code=400, detail="Capacity exceeded")
+
+    # Range validation logic...
+    dist_vehicle_pickup = calculate_distance(vehicle.latitude, vehicle.longitude, shipment.pickup_latitude, shipment.pickup_longitude)
+    dist_pickup_drop = calculate_distance(shipment.pickup_latitude, shipment.pickup_longitude, shipment.drop_latitude, shipment.drop_longitude)
+    if (dist_vehicle_pickup + dist_pickup_drop) > vehicle.max_range * 1.2:
+        raise HTTPException(status_code=400, detail="Range exceeded")
+
     if shipment.assigned_vehicle_id:
-        old_vehicle_result = await db.execute(
-            select(Vehicle).where(Vehicle.id == shipment.assigned_vehicle_id)
-        )
-        old_vehicle = old_vehicle_result.scalar_one_or_none()
-        if old_vehicle:
-            old_vehicle.current_load = max(0.0, old_vehicle.current_load - shipment.weight)
-    
-    # Assign shipment to vehicle
+        old_v = (await db.execute(select(Vehicle).where(Vehicle.id == shipment.assigned_vehicle_id))).scalar_one_or_none()
+        if old_v: old_v.current_load = max(0.0, old_v.current_load - shipment.weight)
+
     shipment.assigned_vehicle_id = vehicle.id
     shipment.status = ShipmentStatus.ASSIGNED
     vehicle.current_load += shipment.weight
@@ -367,26 +337,22 @@ async def manual_assign_shipment(
     await db.refresh(shipment)
     await db.refresh(vehicle)
     
-    logger.info(f"✅ Manual assignment: Shipment {shipment.id} → Vehicle {vehicle.name}")
-    
     return ManualAssignResponse(
-        message=f"Shipment assigned to {vehicle.name} successfully",
+        message=f"Shipment assigned to {vehicle.name}",
         shipment=ShipmentResponse.model_validate(shipment),
         vehicle=VehicleResponse.model_validate(vehicle)
     )
 
 
-# Route Optimization Endpoint
-@app.get("/vehicles/{vehicle_id}/route", response_model=RouteResponse)
+@app.get("/vehicles/{vehicle_id}/route", response_model=RouteResponse, dependencies=[Depends(get_api_key)])
 async def get_vehicle_route(vehicle_id: str, db: AsyncSession = Depends(get_db)):
-    """Get optimized route for a vehicle using TSP with Precedence (Pickup before Drop)."""
+    """Get optimized route (Authenticated)."""
     result = await db.execute(select(Vehicle).where(Vehicle.id == vehicle_id))
     vehicle = result.scalar_one_or_none()
     if not vehicle:
         raise HTTPException(status_code=404, detail="Vehicle not found")
     
     try:
-        # Use TSP with precedence constraint
         route = await calculate_route_with_precedence(db, vehicle_id)
         return route
     except Exception as e:
