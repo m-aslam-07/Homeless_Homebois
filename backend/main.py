@@ -48,14 +48,20 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-# CORS Configuration - Allow ALL origins for hackathon (unbreakable)
+# --- SECURITY FIX: RESTRICTED CORS CONFIGURATION ---
+# Get allowed origins from env or default to localhost for development
+# In production/judging, set ALLOWED_ORIGINS="https://your-frontend-url.vercel.app"
+origins_env = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000,http://localhost:5173,http://localhost:8080")
+origins = [origin.strip() for origin in origins_env.split(",")]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allow all origins for hackathon
-    allow_credentials=True,
-    allow_methods=["*"],  # Allow all HTTP methods
-    allow_headers=["*"],   # Allow all headers
+    allow_origins=origins,      # Explicitly allowed origins only
+    allow_credentials=True,     # Cookies/Auth headers allowed
+    allow_methods=["*"],        # Methods are fine if origin is trusted
+    allow_headers=["*"],        # Headers are fine if origin is trusted
 )
+# ---------------------------------------------------
 
 
 @app.get("/")
